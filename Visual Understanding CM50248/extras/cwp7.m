@@ -1,0 +1,353 @@
+function cwp7()
+
+% images and intrinsics gotten from https://github.com/yihui-he/3D-reconstruction/tree/master/imgs
+    img1_name = 'vase1.jpg';
+    img2_name = 'vase2.jpg';
+    img1 = im2double(imread(img1_name));%image1.tif'));%
+    img2 = im2double(imread(img2_name));%image2.tif'));%
+    if strcmp(img1_name, 'vase1.jpg')
+        K = [1655.837188 0.000000 793.724224;0.000000 1659.189494 655.789420; 0.000000 0.000000 1.000000]; %intrinsics for vase
+    elseif strcmp(img1_name, 'wine1.jpg')
+        K = [1627.498460 0.000000 779.796045;0.000000 1625.250549 582.514895;0.000000 0.000000 1.000000]; %intrisics for wine bottle
+    end
+
+    imshowpair(img2,img1,'montage');%
+    title('The images chosen for demo.');
+
+    original = rgb2gray(img1);
+    distorted = rgb2gray(img2);
+
+    % Detect image features (SURF - Speeded Up Robust Features) and
+    % their points with respect to the image.
+    original_pts = detectSURFFeatures(original);
+    distorted_pts = detectSURFFeatures(distorted);
+
+    % Extract the feature descriptors with their respective valid
+    % points on the image.
+    [original_feat_descriptors, original_valid] = extractFeatures(original, original_pts);
+    [distorted_feat_descriptors, distorted_valid] = extractFeatures(distorted, distorted_pts);
+
+    % Get matches and their corresponding points location
+    index_pairs = matchFeatures(original_feat_descriptors,distorted_feat_descriptors);
+    matched1 = original_valid(index_pairs(:,1));
+    matched2 = distorted_valid(index_pairs(:,2));
+    points1 = matched1.Location;
+    points2 = matched2.Location;
+
+    figure; showMatchedFeatures(img1,img2,matched1,matched2,'montage');
+    
+    P1 = [1 0 0 0; 0 1 0 0; 0 0 1 0];
+    P2 = [ -0.9864 -0.0939 0.1351 -0.9951;0.0953 -0.9954 0.0041 -0.0879; -0.1341 -0.0170 -0.9908 0.0447]
+
+
+    for i=1:size(P2,3)
+        R1 = P1(1:3,1:3);
+        t1 = P1(:,4);
+        R2 = P2(1:3,1:3,i);
+        t2 = P2(:,4,i);
+
+        orien1 = R1';
+        loc1 = -t1'*orien1;
+        orien2 = R2';
+        loc2 = -t2'*orien2
+% 
+%                 figure; plotCamera('Location',loc1,'Orientation', orien1); hold on;
+%                 plotCamera('Location',loc2,'Orientation', orien2); hold off;
+
+        P1 = K*P1;
+        P2f = K*P2(:,:,i);
+        points3D = linear_triangulation(points1, points2, P1, P2f,2);
+
+        figure; hold on;  plot3(points3D(:,2),points3D(:,3),points3D(:,1),'o','MarkerSize',2,'Color','k', 'LineWidth', 1);
+        xlabel('X');ylabel('Z');zlabel('Y');
+
+        [rep_error,proj2D] = find_rep_error(P1, points3D, points1);
+        [rep_error2,proj2D2] = find_rep_error(P2f, points3D, points2);
+
+        figure;  imshow(img1);hold on; plot(proj2D(:,1), proj2D(:,2), 'x', 'Color', 'r'); plot(points1(:,1),points1(:,2), 'o', 'Color', 'g'); hold off;
+        figure;  imshow(img2);hold on; plot(proj2D2(:,1), proj2D2(:,2), 'x', 'Color', 'r'); plot(points2(:,1),points2(:,2), 'o', 'Color', 'g'); hold off;
+
+    end
+
+end
+function [normal_p, T_p] = normalisePoints(p)
+
+    % Normalises the points and return the normalisation matrix T
+    n = size(p,1);
+    mu_p = mean(p);
+    
+    % subtract the mean to make the points zero centred
+    zero_centred = [p(:,1)-mu_p(1) p(:,2)-mu_p(2)];
+    sd_p = std(zero_centred);
+    T_sd_p = [sqrt(2)/sd_p(1),0,0;0,sqrt(2)/sd_p(2),0; 0,0,1];
+    T_mu_p = [1,0,-mu_p(1); 0,1,-mu_p(2);0,0,1];
+    
+    % formulate normalisation matrix T
+    T_p = T_sd_p * T_mu_p;
+    normal_p = T_p * [p'; ones(1,n)];
+    normal_p = normal_p';
+
+end
+
+function F = estimateF(p1,p2)
+% inspired by the photogrammetry course by Cyrill Stachniss (very good
+% lecturer and very in depth explanation)
+% https://www.youtube.com/playlist?list=PLgnQpQtFTOGRsi5vzy9PiQpNWHjq-bKN1
+
+    n = size(p1,1);
+    
+    [normal_p1, T_p1] = normalisePoints(p1);
+    [normal_p2, T_p2] = normalisePoints(p2);
+    
+    for i=1:n
+        A(i,:) = kron(normal_p2(i,:),normal_p1(i,:));
+    end
+
+    %SVD on A
+    [~,~,V] = svd(A);
+    
+    f = V(:,end);
+    Fhat = reshape(f,3,3)';
+    
+    % Find an approximation to F by manually setting the elements
+    % close to 0 to be equal to 0 (constrain enforcement)
+    [U,D,V_] = svd(Fhat);
+    Fn = U * diag( [D(1,1), D(2,2), 0]) * V_';
+    
+    % Denormalise
+    F = T_p2'*Fn*T_p1;
+end
+
+function [F, best_match1, best_match2] = ransac_fundamental(params, feat_points1, feat_points2)
+   % based on https://moodle.bath.ac.uk/pluginfile.php/850436/mod_resource/content/6/CM50248%20Notes%20%282017-10-01%29.pdf
+    feat_num = size(feat_points1, 1)
+    best_num_inliers = 0;
+    best_F = zeros(3,3);
+    best_indices = [];
+    p1 = [feat_points1 ones(feat_num,1)];
+    p2 = [feat_points2 ones(feat_num,1)];
+    for iter = 1: params.it_num
+       
+        % Step 1a: Randomly choose at least 8 points to calculate
+        % fundamental matrix.
+        random_indices = randsample(feat_num, params.num_for_F);
+        points1 = feat_points1(random_indices,:);
+        points2 = feat_points2(random_indices,:);
+        
+        % Step 1b: Compute model using points chosen randomly
+        curr_F = estimateF(points1,points2);
+        
+        % Step 1c: Fit the model on the data to further check for
+        % percentage of inliers        
+        error = sum((p2 .* (curr_F * p1')'),2);
+        numb_of_inliers = size(find(abs(error) <= params.err_thr_inlier),1);
+        
+        % Step 2: Get the highest quality matcher (i.e the most inliers)
+        if (numb_of_inliers > best_num_inliers)
+            best_num_inliers = numb_of_inliers
+            best_F = curr_F;
+            best_indices = random_indices;
+        end   
+    end
+    
+    F = best_F;
+    % Step 3: Optionally refit model to all inliers to improve model 
+    % Consequently getting the best matches for epipolar lines plotting
+    final_error = sum((p2 .* (F * p1')'),2);
+    [~,indices] = sort(abs(final_error),'ascend');
+    best_match1 = feat_points1(indices(1:30),:);
+    best_match2 = feat_points2(indices(1:30),:);
+
+end
+
+function vis_epipolar_lines( F, img1, img2, points1, points2)
+   % F is the fundamental matrix
+   % points1 and points2 are the best inliers of the point correspondences
+   % will use these to draw epipolar lines
+   % by getting two points from the epipolar line 
+    len1 = cross([1 1 1],[1 size(img1,1) 1]);
+    len2 = cross([size(img1,2) 1 1],[size(img1,2) size(img1,1) 1]);
+    
+    figure; imshow(img2);
+    for i = 1:size(points1,1)
+        e = F*[points1(i,:) 1]';
+        pos1 = cross(e,len1);
+        pos2 = cross(e,len2);
+        x1 = [pos1(1)/pos1(3) pos2(1)/pos2(3)];
+        y1 = [pos1(2)/pos1(3) pos2(2)/pos2(3)];
+        line(x1,y1)
+    end
+    
+    hold on
+    plot(points2(:,1),points2(:,2),'go','MarkerFaceColor','b','MarkerSize',7);
+    hold off
+    
+    figure;imshow(img1)
+    for i = 1:size(points2,1)
+        e = F'*[points2(i,:) 1]';
+        pos1 = cross(e,len1);
+        pos2 = cross(e,len2);
+        x2 = [pos1(1)/pos1(3) pos2(1)/pos2(3)];
+        y2 = [pos1(2)/pos1(3) pos2(2)/pos2(3)];
+        line(x2,y2)
+    end
+    
+    hold on
+    plot(points1(:,1),points1(:,2),'go','MarkerFaceColor','b','MarkerSize',7)
+    hold off
+end
+
+function [P1, P2] = camera_projections(F)
+    % P1 = [I|0]
+    P1 = [1 0 0 0; 0 1 0 0; 0 0 1 0];
+    
+    % compute epipole2 (e') as null vector of F
+    [~,~,V] = svd(F);
+    epi2 = V(:,end);
+    
+    % transform epipole2 (3x1) to a skew symmetric matrix (3x3) [e']_x
+    SSM = [0 -epi2(3) epi2(2); epi2(3) 0 -epi2(1); -epi2(2) epi2(1) 0];
+    
+    % [e']_x*F
+    temp = SSM*F;
+    
+    P2 = [temp epi2];
+end
+
+function points3D = linear_triangulation(points1, points2, P1, P2, mode)
+% Correspondence points points1 and points2,
+% together with the two camera projection matrices P1 and P2,
+% The mode is used to decide whether the points are turned back into
+% homogeneous coordinates if mode== 1 then points3D are left in 4D
+% otherwise if mode ==2 then divide by fourth column and get 3 first
+% column.
+
+    % Homogeneous transformation
+    ones_col = ones(size(points1,1),1);
+    X1 = [points1 ones_col];
+    X2 = [points2 ones_col];
+    
+    for i = 1:size(X1,1)
+        % Hartley and Zisserman book page 312 (Second edition)
+        A = [X1(i,1)*P1(3,:) - P1(1,:);
+             X1(i,2)*P1(3,:) - P1(2,:); 
+             X2(i,1)*P2(3,:) - P2(1,:); 
+             X2(i,2)*P2(3,:) - P2(2,:)];
+
+        [~,~,V] = svd(A);
+        temp = V(:,end);
+        points3D(i,:) = temp;
+        
+    end
+
+    % Homogeneous transformation
+    if mode==2
+        for j = 1:size(points3D, 1)
+            points3D(j,:) = points3D(j,:)./points3D(j,4); 
+        end
+        points3D = points3D(:,1:end-1);
+    end
+end
+
+function [error, projected2D] = find_rep_error( P, points3D, points2D)
+
+proj = P*[points3D ones(size(points3D,1),1)]';
+proj = proj';
+u = proj(:,1)./proj(:,3);
+v = proj(:,2)./proj(:,3);
+error = sum(sqrt(power(u-points2D(:,1),2) + power(v-points2D(:,2),2)))
+projected2D = [u v];
+
+end
+
+function [P1,P2] = find_best_P(E,K,points1,points2)
+
+    % P1 = [I|0]
+    P1 = [1 0 0 0; 0 1 0 0; 0 0 1 0];
+
+    W = [0 -1 0; 1 0 0; 0 0 1];
+
+    [U,D,V] = svd(E)
+    
+    P21 = [U*W*V', U(:,3)];
+    P22 = [U*W*V', -U(:,3)];
+    P23 = [U*W'*V', U(:,3)];
+    P24 = [U*W'*V', -U(:,3)];
+    
+    %dont know about these yet
+    npoints1 = [points1 ones(size(points1,1),1)]*inv(K);
+   
+    npoints2 = [points2 ones(size(points2,1),1)]*inv(K); 
+    
+    points3D1 = linear_triangulation(points1, points2, P1, P21,1);
+    points3D2 = linear_triangulation(points1, points2, P1, P22,1);
+    points3D3 = linear_triangulation(points1, points2, P1, P23,1);
+    points3D4 = linear_triangulation(points1, points2, P1, P24,1);
+%     points3D1 = linear_triangulation(npoints1, npoints2, P1, P21,1);
+%     points3D2 = linear_triangulation(npoints1, npoints2, P1, P22,1);
+%     points3D3 = linear_triangulation(npoints1, npoints2, P1, P23,1);
+%     points3D4 = linear_triangulation(npoints1, npoints2, P1, P24,1);
+%     points_in_front1 = find_points_in_front(points3D1,K,P1, P21) 
+%     points_in_front2 = find_points_in_front(points3D2,K,P1, P22) 
+%     points_in_front3 = find_points_in_front(points3D3,K,P1, P23) 
+%     points_in_front4 = find_points_in_front(points3D4,K,P1, P24) 
+
+    [pif11,pif12] = find_points_in_front(points3D1,K,P1, P21); 
+    [pif21,pif22] = find_points_in_front(points3D2,K,P1, P22); 
+    [pif31,pif32] = find_points_in_front(points3D3,K,P1, P23); 
+    [pif41,pif42] = find_points_in_front(points3D4,K,P1, P24); 
+
+    if pif11 == max([pif11,pif21,pif31,pif41]) && pif12 == max([pif12,pif22,pif32,pif42])
+        P2 = P21;
+    elseif pif21 == max([pif11,pif21,pif31,pif41]) && pif22 == max([pif12,pif22,pif32,pif42])
+        P2 = P22;
+    elseif pif31 == max([pif11,pif21,pif31,pif41]) && pif32 == max([pif12,pif22,pif32,pif42])
+        P2 = P23;
+    elseif pif41 == max([pif11,pif21,pif31,pif41]) && pif42 == max([pif12,pif22,pif32,pif42])
+        P2 = P24;
+    else
+        P2(:,:,1) = P21;
+        P2(:,:,2) = P22;
+        P2(:,:,3) = P23;
+        P2(:,:,4) = P24;
+    end
+
+end
+
+function [pif1,pif2] = find_points_in_front(points3D,K,P1, P2)
+% based on Multiple View Geometry page 162, Hartley and Zisserman
+% points3D are actually 4D (not in homogeneous coordinates)
+    R = P2(1:3,1:3);
+
+    C1 = get_camera_coords(P1);
+    C2 = get_camera_coords(P2);
+    
+    pif1 = 0; % points in front of the first camera
+    pif2 = 0; % points in front of the second camera
+    for i = 1:size(points3D,1)
+        
+        temp = (points3D(i,1:3)-C1)*P1(3,1:3)'; % this is w from formula in the book
+        temp2 = (points3D(i,1:3)-C2)*R(3,:)'; % w for the second camera
+        
+        depth = (sign(det(P1(1:3,1:3)))*temp)/points3D(i,4)*norm(P1(3,1:3)); 
+        depth2 = (sign(det(R))*temp2)/points3D(i,4)*norm(R(3,:));
+
+        if depth>0
+            pif1 = pif1 + 1;
+        end
+        if depth2>0
+            pif2 = pif2 + 1;
+        end
+    end
+end
+
+function C = get_camera_coords(P)
+    % Multiple View Geometry page 163
+    x =  det([ P(:,2), P(:,3), P(:,4) ]);
+    y = -det([ P(:,1), P(:,3), P(:,4) ]);
+    z =  det([ P(:,1), P(:,2), P(:,4) ]);
+    t = -det([ P(:,1), P(:,2), P(:,3) ]);
+    
+    C = [x/t y/t z/t];
+
+end
